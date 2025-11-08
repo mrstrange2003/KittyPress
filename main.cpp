@@ -2,14 +2,14 @@
 #include <iostream>
 #include <string>
 #include <filesystem>
-#include <algorithm>
-#include <vector>
+#include <algorithm>   
+#include <vector>      
 #include "huffman.h"
 
 using namespace std;
 
 void printUsage() {
-    cout << "\nKittyPress v2 🐾" << endl;
+    cout << "\nKittyPress v2 " << endl;
     cout << "A lightweight universal archiver (Huffman for text; store for media).\n" << endl;
     cout << "Usage:" << endl;
     cout << "  kittypress compress <input> <output.kitty>" << endl;
@@ -49,7 +49,7 @@ int main(int argc, char* argv[]) {
             string ext = filesystem::path(inputPath).extension().string();
             cout << "Compressing: " << inputPath << " → " << outputPath << endl;
             if (isCompressibleExtension(ext)) {
-                cout << "Mode: Huffman compression (text/source-code) \n";
+                cout << "Mode: Huffman compression (text/source-code)\n";
                 compressFile(inputPath, outputPath);
             } else {
                 cout << "Mode: Storing raw bytes (no compression)\n";
