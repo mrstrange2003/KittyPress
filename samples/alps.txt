@@ -1,0 +1,2431 @@
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
+#include "huffman.h"
+#include "bitstream.h"
+#include "kitty.h"
+#include <iostream>
+#include <bitset>
+#include <iomanip>
+#include <filesystem>
+
+using namespace std;
+
+// Recursive traversal to generate binary codes
+void buildCodes(HuffmanNode* root, const string &str, unordered_map<char, string> &huffmanCode) {
+    if (!root)
+        return;
+
+    // Leaf node = actual character
+    if (!root->left && !root->right)
+        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single char
+
+    buildCodes(root->left, str + "0", huffmanCode);
+    buildCodes(root->right, str + "1", huffmanCode);
+}
+
+// Free allocated Huffman tree memory
+void freeTree(HuffmanNode* root) {
+    if (!root) return;
+    freeTree(root->left);
+    freeTree(root->right);
+    delete root;
+}
+
+// ---------------- COMPRESSION ----------------
+void compressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    string text((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    in.close();
+
+    if (text.empty())
+        throw runtime_error("Input file is empty.");
+
+    // Count frequencies
+    unordered_map<char, int> freq;
+    for (char ch : text)
+        freq[ch]++;
+
+    // Build min-heap (priority queue)
+    priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
+    for (auto &pair : freq)
+        pq.push(new HuffmanNode(pair.first, pair.second));
+
+    // Build Huffman Tree
+    while (pq.size() > 1) {
+        HuffmanNode *left = pq.top(); pq.pop();
+        HuffmanNode *right = pq.top(); pq.pop();
+
+        HuffmanNode *node = new HuffmanNode('\0', left->freq + right->freq);
+        node->left = left;
+        node->right = right;
+        pq.push(node);
+    }
+
+    HuffmanNode *root = pq.top();
+
+    // Generate codes
+    unordered_map<char, string> huffmanCode;
+    buildCodes(root, "", huffmanCode);
+
+    // Encode the input text
+    string encoded;
+    encoded.reserve(text.size() * 8);
+    for (char ch : text)
+        encoded += huffmanCode[ch];
+
+    // Write to output file (.kitty)
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+
+    // Write magic header
+    out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+
+    // 1️⃣ Write Huffman map
+    size_t mapSize = huffmanCode.size();
+    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+
+    for (auto &pair : huffmanCode) {
+        char c = pair.first;
+        string code = pair.second;
+        size_t len = code.size();
+        out.write(&c, sizeof(c));
+        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        out.write(code.c_str(), len);
+    }
+
+    // 2️⃣ Write encoded bitstream length
+    size_t encodedLen = encoded.size();
+    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Write encoded bits via BitWriter
+    BitWriter writer(out);
+    writer.writeBits(encoded);
+    writer.flush();
+
+    out.close();
+    freeTree(root);
+
+    // Compute compression stats
+    auto inputSize = filesystem::file_size(inputPath);
+    auto outputSize = filesystem::file_size(outputPath);
+    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+
+    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
+    cout << "Compressed: " << outputSize << " bytes" << endl;
+    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+}
+
+// ---------------- DECOMPRESSION ----------------
+void decompressFile(const string &inputPath, const string &outputPath) {
+    ifstream in(inputPath, ios::binary);
+    if (!in.is_open())
+        throw runtime_error("Cannot open input file.");
+
+    // Validate magic header
+    string magic(KITTY_MAGIC.size(), '\0');
+    in.read(&magic[0], KITTY_MAGIC.size());
+    if (magic != KITTY_MAGIC)
+        throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+
+    // 1️⃣ Read Huffman map
+    size_t mapSize;
+    in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+
+    unordered_map<char, string> huffmanCode;
+    for (size_t i = 0; i < mapSize; ++i) {
+        char c;
+        size_t len;
+        in.read(&c, sizeof(c));
+        in.read(reinterpret_cast<char*>(&len), sizeof(len));
+        string code(len, '\0');
+        in.read(&code[0], len);
+        huffmanCode[c] = code;
+    }
+
+    // Reverse code map
+    unordered_map<string, char> reverseCode;
+    for (auto &p : huffmanCode)
+        reverseCode[p.second] = p.first;
+
+    // 2️⃣ Read encoded bitstream length
+    size_t encodedLen;
+    in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+
+    // 3️⃣ Read bits via BitReader
+    BitReader reader(in);
+    bool bit;
+    string bitstream;
+    bitstream.reserve(encodedLen);
+    while (reader.readBit(bit))
+        bitstream += (bit ? '1' : '0');
+
+    in.close();
+
+    bitstream = bitstream.substr(0, encodedLen); // trim padding
+
+    // 4️⃣ Decode bitstream
+    string current, decoded;
+    decoded.reserve(bitstream.size() / 8);
+    for (char b : bitstream) {
+        current += b;
+        if (reverseCode.find(current) != reverseCode.end()) {
+            decoded += reverseCode[current];
+            current.clear();
+        }
+    }
+
+    // 5️⃣ Write decompressed file
+    ofstream out(outputPath, ios::binary);
+    if (!out.is_open())
+        throw runtime_error("Cannot open output file for writing.");
+    out.write(decoded.c_str(), decoded.size());
+    out.close();
+
+    cout << "Decompressed successfully → " << outputPath << endl;
+}
