@@ -1,30 +1,28 @@
-// huffman.cpp
+// huffman.cpp  (KP03 - integrates LZ77 + Huffman)
 #include "huffman.h"
 #include "bitstream.h"
 #include "kitty.h"
+#include "lz77.h"
 #include <iostream>
 #include <bitset>
 #include <iomanip>
+#include <sstream>
 #include <filesystem>
 #include <algorithm>
 #include <cstdint>
 
 using namespace std;
 
-// Recursive traversal to generate binary codes
+// --- Huffman helpers (operate on byte streams) ---
 void buildCodes(HuffmanNode* root, const string &str, unordered_map<unsigned char, string> &huffmanCode) {
-    if (!root)
-        return;
-
-    // Leaf node = actual byte
-    if (!root->left && !root->right)
-        huffmanCode[root->ch] = (str.empty() ? "0" : str); // handle single-symbol file
-
+    if (!root) return;
+    if (!root->left && !root->right) {
+        huffmanCode[root->ch] = (str.empty() ? "0" : str);
+    }
     buildCodes(root->left, str + "0", huffmanCode);
     buildCodes(root->right, str + "1", huffmanCode);
 }
 
-// Free allocated Huffman tree memory
 void freeTree(HuffmanNode* root) {
     if (!root) return;
     freeTree(root->left);
@@ -32,20 +30,19 @@ void freeTree(HuffmanNode* root) {
     delete root;
 }
 
-// ---------------- STORE RAW (KP02 store mode) ----------------
+// ---------------- STORE RAW (KP02/KP03 store mode) ----------------
 void storeRawFile(const string &inputPath, const string &outputPath) {
     ifstream in(inputPath, ios::binary);
     if (!in.is_open()) throw runtime_error("Cannot open input file.");
 
-    // Read whole file into buffer
-    vector<unsigned char> buffer((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    vector<uint8_t> buffer((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
     in.close();
 
     ofstream out(outputPath, ios::binary);
     if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
 
-    // Write KP02 signature
-    out.write(KITTY_MAGIC_V2.c_str(), KITTY_MAGIC_V2.size());
+    // write signature KP03 (we're writing KP03 format)
+    out.write(KITTY_MAGIC_V3.c_str(), KITTY_MAGIC_V3.size());
 
     // isCompressed = false
     bool isCompressed = false;
@@ -71,7 +68,6 @@ void restoreRawFile(std::ifstream &inStream, const string &outputPath) {
     uint64_t rawSize;
     inStream.read(reinterpret_cast<char*>(&rawSize), sizeof(rawSize));
     if (!inStream.good()) throw runtime_error("Failed to read raw size.");
-
     vector<char> buffer;
     buffer.resize(rawSize);
     if (rawSize > 0) {
@@ -80,127 +76,135 @@ void restoreRawFile(std::ifstream &inStream, const string &outputPath) {
             throw runtime_error("Unexpected EOF while reading raw payload.");
         }
     }
-
     ofstream out(outputPath, ios::binary);
     if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
     if (rawSize > 0) out.write(buffer.data(), rawSize);
     out.close();
 }
 
-// ---------------- COMPRESSION (writes KP02 with isCompressed = true) ----------------
+// ---------------- SMART COMPRESSION (KP03) ----------------
 void compressFile(const string &inputPath, const string &outputPath) {
     ifstream in(inputPath, ios::binary);
     if (!in.is_open()) throw runtime_error("Cannot open input file.");
 
-    // Read entire file as bytes
-    vector<unsigned char> data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
+    vector<uint8_t> data((istreambuf_iterator<char>(in)), istreambuf_iterator<char>());
     in.close();
-
     if (data.empty()) throw runtime_error("Input file is empty.");
 
-    // Count frequencies for all 0..255 bytes
-    unordered_map<unsigned char, int> freq;
-    for (unsigned char b : data) freq[b]++;
+    // --- Step 1: Run LZ77 -> serialize tokens to bytes ---
+    vector<LZ77Token> tokens = lz77_compress(data);
+    vector<uint8_t> lz77_bytes = lz77_serialize(tokens); // vector<uint8_t>
 
-    // Build min-heap (priority queue)
+    // Build frequency map over lz77_bytes
+    unordered_map<unsigned char, int> freq;
+    for (uint8_t b : lz77_bytes) freq[static_cast<unsigned char>(b)]++;
+
+    // Build Huffman tree
     priority_queue<HuffmanNode*, vector<HuffmanNode*>, Compare> pq;
     for (auto &pair : freq)
         pq.push(new HuffmanNode(pair.first, pair.second));
 
-    // Build Huffman Tree
+    if (pq.empty()) {
+        // no bytes? then just store raw
+        storeRawFile(inputPath, outputPath);
+        return;
+    }
+
     while (pq.size() > 1) {
         HuffmanNode *left = pq.top(); pq.pop();
         HuffmanNode *right = pq.top(); pq.pop();
-
         HuffmanNode *node = new HuffmanNode(0, left->freq + right->freq);
-        node->left = left;
-        node->right = right;
+        node->left = left; node->right = right;
         pq.push(node);
     }
 
     HuffmanNode *root = pq.top();
-
-    // Generate codes
     unordered_map<unsigned char, string> huffmanCode;
     buildCodes(root, "", huffmanCode);
 
-    // Encode the input bytes into a long bit-string
+    // Encode using Huffman
     string encoded;
-    encoded.reserve(data.size() * 8);
-    for (unsigned char b : data) encoded += huffmanCode[b];
+    encoded.reserve(lz77_bytes.size() * 8);
+    for (uint8_t b : lz77_bytes) {
+        unsigned char uc = static_cast<unsigned char>(b);
+        encoded += huffmanCode[uc];
+    }
 
-    // Write to output file (.kitty) - KP02 format
-    ofstream out(outputPath, ios::binary);
-    if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
-
-    // 1) signature
-    out.write(KITTY_MAGIC_V2.c_str(), KITTY_MAGIC_V2.size());
-
-    // 2) isCompressed flag true
+    // Write compressed data to a temporary memory buffer (ostringstream)
+    std::ostringstream tmp;
+    // signature
+    tmp.write(KITTY_MAGIC_V3.c_str(), KITTY_MAGIC_V3.size());
+    // isCompressed = true
     bool isCompressed = true;
-    out.write(reinterpret_cast<const char*>(&isCompressed), sizeof(isCompressed));
-
-    // 3) write original extension
+    tmp.write(reinterpret_cast<const char*>(&isCompressed), sizeof(isCompressed));
+    // extension
     string ext = filesystem::path(inputPath).extension().string();
     uint64_t extLen = ext.size();
-    out.write(reinterpret_cast<const char*>(&extLen), sizeof(extLen));
-    if (extLen > 0) out.write(ext.c_str(), extLen);
+    tmp.write(reinterpret_cast<const char*>(&extLen), sizeof(extLen));
+    if (extLen > 0) tmp.write(ext.c_str(), extLen);
 
-    // 4) write Huffman map (mapSize + entries). Use uint64_t for sizes
+    // Huffman map
     uint64_t mapSize = huffmanCode.size();
-    out.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
+    tmp.write(reinterpret_cast<const char*>(&mapSize), sizeof(mapSize));
     for (auto &pair : huffmanCode) {
         unsigned char c = pair.first;
         string code = pair.second;
         uint64_t len = code.size();
-        out.write(reinterpret_cast<const char*>(&c), sizeof(c));
-        out.write(reinterpret_cast<const char*>(&len), sizeof(len));
-        out.write(code.c_str(), len);
+        tmp.write(reinterpret_cast<const char*>(&c), sizeof(c));
+        tmp.write(reinterpret_cast<const char*>(&len), sizeof(len));
+        tmp.write(code.c_str(), len);
     }
 
-    // 5) encoded bitstream length
+    // encoded length (bits)
     uint64_t encodedLen = encoded.size();
-    out.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
+    tmp.write(reinterpret_cast<const char*>(&encodedLen), sizeof(encodedLen));
 
-    // 6) write encoded bits via BitWriter
-    BitWriter writer(out);
+    // write bitstream using BitWriter on std::ostringstream
+    BitWriter writer(tmp);
     writer.writeBits(encoded);
     writer.flush();
 
-    out.close();
     freeTree(root);
 
-    // Stats
-    auto inputSize = filesystem::file_size(inputPath);
-    auto outputSize = filesystem::file_size(outputPath);
-    double ratio = 100.0 * (1.0 - (double)outputSize / inputSize);
+    // --- Step 2: Decide whether to keep compressed buffer or store raw ---
+    string compressedData = tmp.str();
+    size_t compressedSize = compressedData.size();
+    size_t originalSize = data.size();
 
-    cout << "\nOriginal:   " << inputSize << " bytes" << endl;
-    cout << "Compressed: " << outputSize << " bytes" << endl;
-    cout << "Compression: " << fixed << setprecision(2) << ratio << "% 🐾" << endl;
+    ofstream outFile(outputPath, ios::binary);
+    if (!outFile.is_open()) throw runtime_error("Cannot open output file for writing.");
+
+    if (compressedSize < originalSize) {
+        cout << "🐾 Smart Mode: Compression effective ("
+             << fixed << setprecision(2)
+             << 100.0 * (1.0 - (double)compressedSize / originalSize)
+             << "% saved)\n";
+        outFile.write(compressedData.c_str(), compressedData.size());
+    } else {
+        cout << "⚡ Smart Mode: Compression skipped (file too compact)\n";
+        outFile.close();
+        storeRawFile(inputPath, outputPath);
+        return;
+    }
+
+    outFile.close();
+
+    cout << "✅ Final size: " << compressedSize << " bytes (original " << originalSize << ")\n";
 }
 
-// ---------------- DECOMPRESSION (accepts KP01 and KP02) ----------------
+// ---------------- DECOMPRESSION (accepts KP01, KP02, KP03) ----------------
 void decompressFile(const string &inputPath, const string &outputPath) {
     ifstream in(inputPath, ios::binary);
     if (!in.is_open()) throw runtime_error("Cannot open input file.");
 
-    // Read first 4 bytes as signature candidate
+    // Read the first 4 bytes (signature candidate)
     string magic(4, '\0');
     in.read(&magic[0], 4);
     if (!in) throw runtime_error("Failed to read file signature.");
 
-    // If KP01 (old format), rewind and use old v1 logic
+    // --- KP01 (old) handling ---
     if (magic == KITTY_MAGIC_V1) {
-        // rewind to beginning (we already consumed 4 bytes)
-        in.seekg(4, ios::beg); // position after "KP01"
-        // Original KP01 format (what your earlier code expected) assumed no ext/isCompressed flag, and mapSize is next.
-        // For simplicity, reuse prior logic by reading from after signature (i.e., exactly like old code expected),
-        // but since the old code read mapSize immediately (no signature), we need to adapt: your old compressor didn't write KP01
-        // at the start in your earlier version — if your old files do start with KP01, this code will work.
-        // We'll now parse using the KP01 structure (mapSize, entries, encodedLen, bytes).
-        // NOTE: If older files had no signature at all, adjust accordingly. But earlier we wrote KP01 as signature already.
-        // Read mapSize
+        // older format: mapSize etc (assume 64-bit sizes were used)
         uint64_t mapSize;
         in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
         unordered_map<unsigned char, string> huffmanCode;
@@ -213,20 +217,17 @@ void decompressFile(const string &inputPath, const string &outputPath) {
             in.read(&code[0], len);
             huffmanCode[c] = code;
         }
-        // encoded length
         uint64_t encodedLen;
         in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
-        // read bytes (older format used raw bytes stored; use BitReader)
         BitReader reader(in);
         bool bit;
         string bitstream;
         bitstream.reserve(encodedLen);
         while (reader.readBit(bit)) bitstream += (bit ? '1' : '0');
         in.close();
-        bitstream = bitstream.substr(0, encodedLen);
+        if (bitstream.size() > encodedLen) bitstream.resize(encodedLen);
         unordered_map<string, unsigned char> reverseCode;
         for (auto &p : huffmanCode) reverseCode[p.second] = p.first;
-        // decode
         string current;
         vector<char> decoded;
         for (char b : bitstream) {
@@ -237,7 +238,6 @@ void decompressFile(const string &inputPath, const string &outputPath) {
                 current.clear();
             }
         }
-        // write out
         ofstream out(outputPath, ios::binary);
         if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
         if (!decoded.empty()) out.write(decoded.data(), decoded.size());
@@ -246,16 +246,71 @@ void decompressFile(const string &inputPath, const string &outputPath) {
         return;
     }
 
-    // If not KP01, check KP02
-    if (magic != KITTY_MAGIC_V2) {
+    // --- KP02 handling ---
+    if (magic == KITTY_MAGIC_V2) {
+        bool isCompressed = false;
+        in.read(reinterpret_cast<char*>(&isCompressed), sizeof(isCompressed));
+        uint64_t extLen = 0;
+        in.read(reinterpret_cast<char*>(&extLen), sizeof(extLen));
+        if (extLen > 0) {
+            string ext; ext.resize(extLen);
+            in.read(&ext[0], extLen);
+        }
+        if (!isCompressed) {
+            restoreRawFile(in, outputPath);
+            in.close();
+            cout << "Restored raw file (KP02) → " << outputPath << endl;
+            return;
+        }
+        // compressed path for KP02 (Huffman decode to bytes)
+        uint64_t mapSize;
+        in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
+        unordered_map<unsigned char, string> huffmanCode;
+        for (uint64_t i = 0; i < mapSize; ++i) {
+            unsigned char c; uint64_t len;
+            in.read(reinterpret_cast<char*>(&c), sizeof(c));
+            in.read(reinterpret_cast<char*>(&len), sizeof(len));
+            string code(len, '\0');
+            in.read(&code[0], len);
+            huffmanCode[c] = code;
+        }
+        uint64_t encodedLen;
+        in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
+        BitReader reader(in);
+        bool bit;
+        string bitstream;
+        bitstream.reserve(encodedLen);
+        while (reader.readBit(bit)) bitstream += (bit ? '1' : '0');
+        in.close();
+        if (bitstream.size() > encodedLen) bitstream.resize(encodedLen);
+        unordered_map<string, unsigned char> reverseCode;
+        for (auto &p : huffmanCode) reverseCode[p.second] = p.first;
+        string current;
+        vector<char> decoded;
+        for (char b : bitstream) {
+            current += b;
+            auto it = reverseCode.find(current);
+            if (it != reverseCode.end()) {
+                decoded.push_back((char)it->second);
+                current.clear();
+            }
+        }
+        ofstream out(outputPath, ios::binary);
+        if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
+        if (!decoded.empty()) out.write(decoded.data(), decoded.size());
+        out.close();
+        cout << "Decompressed (KP02) successfully → " << outputPath << endl;
+        return;
+    }
+
+    // --- KP03 (LZ77 + Huffman) handling ---
+    if (magic != KITTY_MAGIC_V3) {
         throw runtime_error("Unknown or corrupted .kitty file (bad signature).");
     }
 
-    // Now parse KP02 header:
-    // isCompressed flag
+    // read isCompressed flag and ext
     bool isCompressed = false;
     in.read(reinterpret_cast<char*>(&isCompressed), sizeof(isCompressed));
-    // read extension
     uint64_t extLen = 0;
     in.read(reinterpret_cast<char*>(&extLen), sizeof(extLen));
     string ext;
@@ -264,22 +319,19 @@ void decompressFile(const string &inputPath, const string &outputPath) {
         in.read(&ext[0], extLen);
     }
 
-    // If stored raw, restore raw bytes and write to outputPath (or append ext)
     if (!isCompressed) {
-        // There is rawSize + raw bytes next
         restoreRawFile(in, outputPath);
         in.close();
-        cout << "Restored raw file → " << outputPath << endl;
+        cout << "Restored raw file (KP03) → " << outputPath << endl;
         return;
     }
 
-    // Otherwise isCompressed == true: read Huffman map and decode (KP02 compressed payload)
+    // compressed: read Huffman map
     uint64_t mapSize = 0;
     in.read(reinterpret_cast<char*>(&mapSize), sizeof(mapSize));
     unordered_map<unsigned char, string> huffmanCode;
     for (uint64_t i = 0; i < mapSize; ++i) {
-        unsigned char c;
-        uint64_t len;
+        unsigned char c; uint64_t len;
         in.read(reinterpret_cast<char*>(&c), sizeof(c));
         in.read(reinterpret_cast<char*>(&len), sizeof(len));
         string code(len, '\0');
@@ -287,41 +339,42 @@ void decompressFile(const string &inputPath, const string &outputPath) {
         huffmanCode[c] = code;
     }
 
-    // encoded length
+    // read encoded bitstream length
     uint64_t encodedLen = 0;
     in.read(reinterpret_cast<char*>(&encodedLen), sizeof(encodedLen));
 
-    // read bitstream
+    // read bitstream via BitReader
+    // We need to read bytes until EOF for the bitstream (reader will return false at EOF)
     BitReader reader(in);
     bool bit;
     string bitstream;
     bitstream.reserve(encodedLen);
     while (reader.readBit(bit)) bitstream += (bit ? '1' : '0');
     in.close();
-
     if (bitstream.size() > encodedLen) bitstream.resize(encodedLen);
 
-    // reverse map and decode
+    // Huffman decode -> get bytes of serialized LZ77 tokens
     unordered_map<string, unsigned char> reverseCode;
     for (auto &p : huffmanCode) reverseCode[p.second] = p.first;
-
     string current;
-    vector<char> decoded;
-    decoded.reserve(bitstream.size() / 8);
+    vector<uint8_t> tokenBytes;
     for (char b : bitstream) {
         current += b;
         auto it = reverseCode.find(current);
         if (it != reverseCode.end()) {
-            decoded.push_back((char)it->second);
+            tokenBytes.push_back(it->second);
             current.clear();
         }
     }
 
-    // write decompressed file
+    // Deserialize tokens, then LZ77 decompress to recover original bytes
+    auto tokens_out = lz77_deserialize(tokenBytes);
+    auto original = lz77_decompress(tokens_out);
+
     ofstream out(outputPath, ios::binary);
     if (!out.is_open()) throw runtime_error("Cannot open output file for writing.");
-    if (!decoded.empty()) out.write(decoded.data(), decoded.size());
+    if (!original.empty()) out.write(reinterpret_cast<const char*>(original.data()), original.size());
     out.close();
 
-    cout << "Decompressed successfully → " << outputPath << endl;
+    cout << "Decompressed (KP03) successfully → " << outputPath << endl;
 }
