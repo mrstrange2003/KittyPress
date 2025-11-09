@@ -26,10 +26,10 @@ struct Compare {
     }
 };
 
-// Function declarations
-void compressFile(const std::string &inputPath, const std::string &outputPath); // writes KP02 with isCompressed = true
-void decompressFile(const std::string &inputPath, const std::string &outputPath); // handles KP01 & KP02
+// Main API (now KP03 aware)
+void compressFile(const std::string &inputPath, const std::string &outputPath); // writes KP03 with LZ77+Huffman (or KP02 raw/Huffman)
+void decompressFile(const std::string &inputPath, const std::string &outputPath); // handles KP01, KP02, KP03
 
-// Helpers for storing raw files inside .kitty (KP02 with isCompressed = false)
+// Helpers for storing raw files inside .kitty (KP02/KP03 with isCompressed = false)
 void storeRawFile(const std::string &inputPath, const std::string &outputPath);
 void restoreRawFile(std::ifstream &inStream, const std::string &outputPath);
