@@ -1,10 +1,11 @@
 // bitstream.cpp
 #include "bitstream.h"
+#include <iostream>
 
-BitWriter::BitWriter(std::ofstream &stream) : out(stream), buffer(0), bitCount(0) {}
+BitWriter::BitWriter(std::ostream &stream) : out(stream), buffer(0), bitCount(0) {}
 
 void BitWriter::writeBit(bool bit) {
-    buffer = (buffer << 1) | bit;
+    buffer = (buffer << 1) | (bit ? 1 : 0);
     bitCount++;
     if (bitCount == 8) {
         out.write(reinterpret_cast<const char*>(&buffer), 1);
@@ -14,8 +15,7 @@ void BitWriter::writeBit(bool bit) {
 }
 
 void BitWriter::writeBits(const std::string &bits) {
-    for (char c : bits)
-        writeBit(c == '1');
+    for (char c : bits) writeBit(c == '1');
 }
 
 void BitWriter::flush() {
@@ -29,7 +29,7 @@ void BitWriter::flush() {
 
 // ---------------- BitReader ----------------
 
-BitReader::BitReader(std::ifstream &stream) : in(stream), buffer(0), bitCount(0) {}
+BitReader::BitReader(std::istream &stream) : in(stream), buffer(0), bitCount(0) {}
 
 bool BitReader::readBit(bool &bit) {
     if (bitCount == 0) {
@@ -37,8 +37,8 @@ bool BitReader::readBit(bool &bit) {
             return false;
         bitCount = 8;
     }
-
-    bit = (buffer & 0x80) != 0; // read MSB
+    // Read MSB first
+    bit = (buffer & 0x80) != 0;
     buffer <<= 1;
     bitCount--;
     return true;
