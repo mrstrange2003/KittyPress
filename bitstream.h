@@ -1,26 +1,28 @@
 // bitstream.h
 #pragma once
-#include <fstream>
-#include <vector>
+#include <istream>
+#include <ostream>
+#include <cstdint>
+#include <string>
 
 class BitWriter {
-    std::ofstream &out;
-    unsigned char buffer;
+    std::ostream &out;
+    uint8_t buffer;
     int bitCount;
 
 public:
-    BitWriter(std::ofstream &stream);
+    BitWriter(std::ostream &stream);
     void writeBit(bool bit);
     void writeBits(const std::string &bits);
     void flush();
 };
 
 class BitReader {
-    std::ifstream &in;
-    unsigned char buffer;
+    std::istream &in;
+    uint8_t buffer;
     int bitCount;
 
 public:
-    BitReader(std::ifstream &stream);
+    BitReader(std::istream &stream);
     bool readBit(bool &bit);
 };
