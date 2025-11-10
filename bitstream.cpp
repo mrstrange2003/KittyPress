@@ -27,7 +27,7 @@ void BitWriter::flush() {
     }
 }
 
-// ---------------- BitReader ----------------
+//BitReader
 
 BitReader::BitReader(std::istream &stream) : in(stream), buffer(0), bitCount(0) {}
 
