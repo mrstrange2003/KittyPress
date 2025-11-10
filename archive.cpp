@@ -1,3 +1,4 @@
+//archive.cpp
 #include "archive.h"
 #include "huffman.h"
 #include "kitty.h"
@@ -50,7 +51,7 @@ void createArchive(const vector<string>& inputs, const string& outputArchive) {
 
         // compress to temporary file buffer using existing API
         string tmpOut = f.absPath + ".tmpkitty";
-        compressFile(f.absPath, tmpOut);  // produces KP03 per-file
+        compressFile(f.absPath, tmpOut);  // produces KP03 per file
 
         ifstream comp(tmpOut, ios::binary);
         vector<uint8_t> stored((istreambuf_iterator<char>(comp)),
@@ -58,7 +59,7 @@ void createArchive(const vector<string>& inputs, const string& outputArchive) {
         comp.close();
         fs::remove(tmpOut);
 
-        bool isCompressed = true; // already handled in compressFile
+        bool isCompressed = true; // handled in compressFile
         uint16_t pathLen = (uint16_t)f.relPath.size();
         uint8_t flags = 1; // compressed flag
         uint64_t origSize = data.size();
@@ -116,7 +117,7 @@ void extractArchive(const string& archivePath, const string& outputFolder) {
         decompressFile(tmp, outPath.string());
         fs::remove(tmp);
 
-        cout << "  ✔ " << rel << " (" << origSize << " bytes)\n";
+        cout << "  Done " << rel << " (" << origSize << " bytes)\n";
     }
 
     in.close();
