@@ -50,3 +50,4 @@ int main(int argc, char* argv[]) {
     cout << "[KittyPress] Done.\n";
     return 0;
 }
+
