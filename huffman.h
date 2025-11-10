@@ -9,7 +9,7 @@
 #include <memory>
 #include <cstdint>
 
-// Use unsigned char for full 0..255 byte support
+// Use unsigned char for full 0-255 byte support
 struct HuffmanNode {
     unsigned char ch;
     int freq;
@@ -26,7 +26,7 @@ struct Compare {
     }
 };
 
-// Main API (now KP03 aware)
+// Main API (KP03 aware)
 void compressFile(const std::string &inputPath, const std::string &outputPath); // writes KP03 with LZ77+Huffman (or KP02 raw/Huffman)
 void decompressFile(const std::string &inputPath, const std::string &outputPath); // handles KP01, KP02, KP03
 
