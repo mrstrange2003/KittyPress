@@ -1,4 +1,4 @@
-// kitty.h
+// kitty.h 
 #pragma once
 #include <string>
 
