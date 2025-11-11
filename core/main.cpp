@@ -10,6 +10,7 @@ namespace fs = std::filesystem;
 
 void printUsage() {
     cout << "\nKittyPress v4 " << endl;
+    
     cout << "Universal lossless archiver using LZ77 + Huffman (multi-file supported)\n\n";
     cout << "Usage:\n"
          << "  kittypress compress <input1> [<input2> ...] <output.kitty>\n"
