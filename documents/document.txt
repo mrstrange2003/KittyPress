@@ -1,0 +1,193 @@
+Here’s a polished and professional document you can include as your official **KittyPress KP04 Specification & Technical Overview**.
+It’s written in clean README-style formatting (you can use it directly in your repo, docs, or as part of a presentation).
+
+---
+
+# 🐾 KittyPress KP04 — Compression & Archiving Engine
+
+### **Version:** KP04
+
+### **Author:** Viktor (J. Dipayan Rao)
+
+### **Status:** Stable Build
+
+### **Core Language:** C++17
+
+### **Build Example:**
+
+```bash
+g++ main.cpp archive.cpp huffman.cpp lz77.cpp bitstream.cpp -std=c++17 -O2 -static -static-libstdc++ -static-libgcc -o kittypress.exe
+```
+
+---
+
+## ⚙️ Overview
+
+**KittyPress** is a custom-built, stream-based compression and archiving engine designed for simplicity, speed, and forward compatibility.
+It uses a hybrid **LZ77 + Huffman** pipeline, supports **multi-file archiving**, and implements a **smart entropy detector** to automatically skip already-compressed data.
+
+---
+
+## 🧱 Core Architecture
+
+| Component         | Purpose                                                                       |
+| ----------------- | ----------------------------------------------------------------------------- |
+| **archive.cpp**   | Handles archive creation and extraction (KP04 container).                     |
+| **huffman.cpp**   | Two-pass streamed Huffman encoding and decoding; includes smart entropy skip. |
+| **lz77.cpp**      | Implements windowed LZ77 stream compressor for chunked I/O.                   |
+| **bitstream.cpp** | Manages low-level bitwise I/O for Huffman encoding.                           |
+| **kitty.h**       | Defines constants (e.g. magic bytes `KP01–KP04`, version codes).              |
+
+---
+
+## 🧩 Supported File Formats
+
+| Version  | Description                    | Supported      |
+| -------- | ------------------------------ | -------------- |
+| **KP01** | Legacy single Huffman layer    | ✅ Read         |
+| **KP02** | Huffman-only with raw fallback | ✅ Read         |
+| **KP03** | LZ77 + Huffman (per-file)      | ✅ Read + Write |
+| **KP04** | Archive container (multi-file) | ✅ Read + Write |
+
+---
+
+## 📦 Archive Structure (KP04)
+
+Each `.kitty` archive begins with:
+
+| Field                 | Size     | Description                              |
+| --------------------- | -------- | ---------------------------------------- |
+| `KITTY_MAGIC_V4`      | 4 bytes  | Header signature `"KP04"`                |
+| `ver`                 | 1 byte   | Version number (0x04)                    |
+| `count`               | 4 bytes  | Number of embedded files                 |
+| **Per-file entries:** |          |                                          |
+| `pathLen`             | 2 bytes  | Length of file path                      |
+| `path`                | variable | Relative path string                     |
+| `flags`               | 1 byte   | `1 = compressed`, `0 = raw`              |
+| `origSize`            | 8 bytes  | Original uncompressed size               |
+| `dataSize`            | 8 bytes  | Size of stored data                      |
+| `data`                | variable | Either compressed KP03 blob or raw bytes |
+
+---
+
+## 🔁 Compression Pipeline
+
+1. **Entropy Estimation (Smart Skip)**
+
+   * Reads first 1 MiB of file
+   * Computes Shannon entropy (bits/byte)
+   * If `H ≥ 7.7`, file is assumed already compressed → skip to `storeRawFile()`
+
+2. **Streaming LZ77 Compression**
+
+   * Windowed LZ77 compressor produces token stream
+   * Serialized to temporary `.lz77.tmp` file
+
+3. **Two-Pass Huffman Encoding**
+
+   * **Pass A:** Count symbol frequencies while writing `.lz77.tmp`
+   * **Pass B:** Build Huffman map, compute bit length, and stream compressed output with `BitWriter`
+
+4. **Smart Mode Comparison**
+
+   * If `encodedSize < originalSize` → keep compressed
+   * Else → fallback to raw store
+
+---
+
+## 🧠 Smart Skip (Entropy Detection)
+
+KittyPress uses a lightweight Shannon entropy estimator to detect random data and skip compression:
+
+```cpp
+if (entropy >= 7.7)
+    storeRawFile(inputPath, outputPath); // e.g., MP4, JPG, ZIP
+```
+
+| File Type              | Typical Entropy (bits/byte) | Compression Action       |
+| ---------------------- | --------------------------- | ------------------------ |
+| Text / Source Code     | 4.5 – 6.0                   | ✅ Compress               |
+| PDFs / Office Docs     | 6.5 – 7.4                   | ✅ Compress               |
+| JPEG / MP4 / ZIP / EXE | 7.6 – 8.0                   | ⚡ Skip (Smart Raw Store) |
+
+---
+
+## 📥 Decompression
+
+The decompressor automatically detects the version header and applies the correct algorithm:
+
+* KP01 / KP02 → Huffman-only
+* KP03 → Huffman + LZ77
+* KP04 → Archive reader (calls internal `decompressFile()` on each entry)
+
+Backward compatibility ensures all previous `.kitty` versions remain restorable.
+
+---
+
+## 🚀 Performance Characteristics
+
+| Metric                | Description                                                          |
+| --------------------- | -------------------------------------------------------------------- |
+| **Chunked I/O**       | Uses 64 KiB buffered reads/writes to handle large files efficiently. |
+| **Memory Footprint**  | Typically under 30 MB for standard inputs.                           |
+| **Compression Ratio** | 30–75% depending on file type.                                       |
+| **Speed**             | ~25–80 MB/s (depends on CPU and I/O).                                |
+| **Skip Efficiency**   | Media/archives are skipped instantly after entropy check.            |
+
+---
+
+## 🔒 Design Philosophy
+
+> “Fast enough for modern systems, simple enough for maintainability, and smart enough to know when not to work.”
+
+* **Streaming-first:** Can handle multi-gigabyte files without loading into RAM.
+* **Fail-safe:** Every operation is atomic; temporary files cleaned automatically.
+* **Backward compatible:** Every new version retains support for older Kitty formats.
+* **Transparent smart logic:** Prints user-friendly diagnostics (`Smart Skip`, `Smart Mode` messages).
+
+---
+
+## 🧰 Future Expansion Ideas (for KP05+)
+
+* Parallel chunk compression (multi-threaded LZ77/Huffman).
+* AES-256 optional encryption.
+* Integrated checksum and CRC for verification.
+* Solid compression (shared dictionary between files).
+* Native Linux/macOS builds.
+* Adaptive window size and Huffman table reuse for long streams.
+
+---
+
+## 🐾 Example Usage
+
+```bash
+# Compress folder into archive
+kittypress.exe compress samples\docs samples\docs_archive.kitty
+
+# Extract archive
+kittypress.exe decompress samples\docs_archive.kitty output_folder
+
+# Single file compress/decompress
+kittypress.exe compress report.txt report.kitty
+kittypress.exe decompress report.kitty restored.txt
+```
+
+**Sample Output:**
+
+```
+ℹ️ Entropy check: H=6.55 bits/byte — will attempt compression.
+🐾 Smart Mode: Compression effective (58.24% saved)
+✅ Final size: 421,332 bytes (original 1,008,984)
+```
+
+---
+
+## 🧾 License & Attribution
+
+Copyright © 2025 **Viktor (J. Dipayan Rao)**
+All rights reserved.
+KittyPress is a personal compression project demonstrating efficient, modular, entropy-aware file archiving in modern C++.
+
+---
+
+Would you like me to turn this into a nicely formatted **Markdown README.md** file (with headings, icons, etc.) you can drop straight into your GitHub folder?

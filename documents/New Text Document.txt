@@ -1,0 +1,715 @@
+Awesome—here’s a crisp, end-to-end plan you can follow. I’ll keep it actionable, with concrete deliverables and acceptance checks at each step.
+
+# Step-by-step plan
+
+## 0) Decide scope (10 minutes)
+
+* **Algorithm for v1:** Huffman (better learning + compression than RLE).
+* **Input v1:** `.txt` only.
+* **Output:** Custom binary format `.kitty`.
+* **Interfaces:**
+
+  * C++ CLI for compress/decompress.
+  * Python GUI (desktop via Tkinter) that calls the same engine.
+  * Android app (Kivy) *after* desktop GUI is done.
+* **Goal:** 100% lossless round-trip; simple file format; easy to extend to Android.
+
+---
+
+## 1) Design the `.kitty` file format (spec first!)
+
+**Deliverable:** a short spec file `docs/kitty_format_spec.md`.
+
+**Minimal, robust layout (single file payload):**
+
+```
+Offset  Size      Field
+0       6         Magic = "KITTY\0"    // to identify files
+6       1         Version = 1
+7       1         Method = 1           // 1=Huffman, 2=RLE (future)
+8       4         OriginalSize (uint32)
+12      1         PaddingBits (0–7)    // how many unused bits in last data byte
+13      2         SymbolCount (uint16) // number of distinct symbols in table
+15      N         Codebook entries, repeated SymbolCount times:
+                  [1 byte Symbol][1 byte CodeLen][ceil(CodeLen/8) bytes CodeBits MSB-first]
+...               (CodeLen ∈ [1..32] is plenty for text)
+?       4         CRC32 of original data (optional but recommended)
+?       M         Compressed bitstream (packed to bytes, MSB-first)
+```
+
+**Acceptance checks:**
+
+* Can uniquely reconstruct codebook.
+* Know exactly how many valid bits are in the last byte (`PaddingBits`).
+* CRC32 lets you verify correctness on decompress.
+
+---
+
+## 2) C++ core library + CLI (the engine)
+
+**Folder skeleton**
+
+```
+KittyZip/
+├─ include/
+│  ├─ kitty.h
+├─ src/
+│  ├─ main.cpp           // CLI entry
+│  ├─ huffman.cpp
+│  ├─ bitstream.cpp
+│  ├─ fileio.cpp
+├─ tests/
+│  ├─ samples/ (small .txt files)
+├─ docs/
+│  ├─ kitty_format_spec.md
+├─ build/ (ignored)
+```
+
+**Implement in this order**
+
+1. **Bit I/O utilities** (`bitstream.cpp`)
+
+   * Writer: push bits, flush to bytes, track `PaddingBits`.
+   * Reader: read bits MSB-first.
+   * Acceptance: round-trip random bit patterns.
+
+2. **Frequency & tree**
+
+   * Count char frequencies (unsigned char) from input text.
+   * Min-heap to build Huffman tree (greedy combine).
+   * Acceptance: stable for ties (e.g., tie-break on ASCII to get deterministic codes).
+
+3. **Codebook generation**
+
+   * DFS tree: left=0, right=1 → code per symbol.
+   * Store code lengths and codes (as integers/bit vectors).
+   * Acceptance: prefix-free, no empty code unless single-symbol file (edge case → give it code “0”).
+
+4. **Encoder**
+
+   * Map each input byte → write its code bits to `BitWriter`.
+   * Record `PaddingBits`.
+
+5. **Header writer**
+
+   * Write fields exactly as in spec (use fixed endianness: little-endian for integers).
+   * Serialize codebook: for each symbol, write `[sym][codelen][codebits]`.
+   * Compute and write **CRC32** of original bytes.
+
+6. **Decoder**
+
+   * Read header → reconstruct codebook.
+   * Build a decode trie (or table).
+   * Stream bits → emit bytes until `OriginalSize` reached.
+   * Validate CRC32 matches.
+
+7. **CLI wrapper (`main.cpp`)**
+
+   ```
+   kittyzip compress <input.txt> <output.kitty>
+   kittyzip decompress <input.kitty> <output.txt>
+   ```
+
+   * Proper error messages, exit codes.
+   * Show stats: original size, compressed size, ratio.
+
+**Acceptance tests**
+
+* Tiny files: `""`, `"a"`, `"aaaa"`, `"abababab"`, typical English paragraph, Unicode within ASCII for now.
+* Edge cases: single unique symbol, file with many distinct symbols, empty file (support by writing size=0).
+* Verify: decompress(compress(x)) == x, CRC32 passes, ratio reasonable.
+
+---
+
+## 3) Packaging the C++ as a shared library (for Python)
+
+**Goal:** reuse the same engine from GUI with zero duplicate logic.
+
+**Two paths (pick one):**
+
+* **pybind11 (recommended):** clean Pythonic API.
+* **ctypes:** simpler build, more manual typing.
+
+**Expose functions:**
+
+```cpp
+// kitty.h (C API style if using ctypes)
+extern "C" {
+  int kitty_compress(const char* in_path, const char* out_path, char* errbuf, int errbuf_len);
+  int kitty_decompress(const char* in_path, const char* out_path, char* errbuf, int errbuf_len);
+}
+```
+
+Return 0 on success; on error, write message to `errbuf`.
+
+**Acceptance:**
+
+* From a Python REPL, call `kitty_compress()` and `kitty_decompress()` on sample files and validate.
+
+---
+
+## 4) Desktop GUI (Python + Tkinter)
+
+**Deliverable:** `python_app/desktop_app.py`
+
+**Features (minimal):**
+
+* Buttons: `Select .txt` → Compress → outputs `.kitty`.
+* `Select .kitty` → Decompress → outputs `.txt`.
+* Progress/status label, error dialogs.
+* File size & ratio display.
+
+**Acceptance:**
+
+* Works on Windows without Python after packaging with **PyInstaller**:
+
+  ```
+  pyinstaller --onefile --add-binary "libkittyzip.dll;." desktop_app.py
+  ```
+* Double-clickable exe; compress/decompress succeeds on test files.
+
+---
+
+## 5) Android app (Python + Kivy)
+
+**Deliverable:** `mobile_app/main.py` + `buildozer.spec`
+
+**UI (minimal):**
+
+* Two tabs: Compress | Decompress
+* File chooser (request storage permission)
+* Call the **same** library or re-implement decode/encode in Python if NDK linking is heavy initially.
+
+**Build:**
+
+* Use **Buildozer** to create `.apk`.
+* If linking C++ directly is complex at first, **port the decoder** to Python (decoding is lighter than encoding) and ship “decompress-only” mobile v1. Then add compression with NDK later.
+
+**Acceptance:**
+
+* Install `.apk` on Android.
+* Select `.txt` → get `.kitty` (or start with decompress).
+* Files appear in app’s storage / Downloads with a toast confirmation.
+
+---
+
+## 6) Verification, benchmarks & UX polish
+
+* Add `--verify` CLI flag: decompress in memory and compare CRC32 immediately after compression for sanity check on critical runs.
+* Add `--info file.kitty` to print header info and codebook summary.
+* Benchmark: measure speed and ratio on 100KB–10MB text samples.
+* Handle Unicode text by reading raw bytes; don’t assume UTF-8 characters at algorithm level (it’s byte-oriented).
+
+---
+
+## 7) Documentation & distribution
+
+* `README.md`: how to use CLI, how to install desktop app, how to install APK.
+* `docs/kitty_format_spec.md`: your public spec (interoperability future).
+* License (MIT/Apache 2.0).
+* Optional: small sample `.kitty` + its original `.txt` for testers.
+
+---
+
+## 8) Stretch goals (optional, in order)
+
+1. Add **RLE** method and support `--method rle|huffman`.
+2. Add **block CRC** and streaming decode.
+3. Add **ZIP-container compatibility** (write ZIP headers with custom method code).
+4. Add **multi-file archive** support inside `.kitty` (central directory).
+5. Add **compression levels**: faster vs smaller (e.g., adaptive codebook heuristics).
+
+---
+
+# Concrete task checklist (copy/paste this into your tracker)
+
+* [ ] Write `docs/kitty_format_spec.md` (finalize header layout).
+* [ ] Implement BitWriter/BitReader (+ tests).
+* [ ] Implement Huffman build + codebook (+ tests).
+* [ ] Implement encoder/decoder (+ tests).
+* [ ] Implement header read/write, CRC32.
+* [ ] Implement CLI (`compress`, `decompress`, `--info`, `--verify`).
+* [ ] Golden tests: round-trip for sample files; store expected CRC/size.
+* [ ] Build shared lib (`.dll/.so`) with `kitty_compress/kitty_decompress`.
+* [ ] Tkinter desktop GUI that calls the shared lib.
+* [ ] Package desktop app with PyInstaller.
+* [ ] Kivy mobile app (start with **decompress-only** if needed).
+* [ ] Build Android `.apk` with Buildozer.
+* [ ] README + usage + samples.
+
+---
+
+If you want, I can spin up the exact **`.kitty` header struct definitions** (C++ side) and a tiny **pseudocode** for both write/read paths so you can start coding immediately.
+
+
+
+
+
+
+
+
+
+
+Excellent question, Viktor 👏 — and this shows you’re *really* thinking like a systems engineer now.
+
+The `KP01` part — that tiny 4-character string at the start of every `.kitty` file — is called a **magic number** or **file signature**.
+It’s small, but it’s **extremely important** in real-world file formats.
+
+Let’s break it down perfectly 👇
+
+---
+
+## 🪪 What `"KP01"` Actually Does
+
+Every `.kitty` file you create starts with:
+
+```cpp
+out.write(KITTY_MAGIC.c_str(), KITTY_MAGIC.size());
+```
+
+And `KITTY_MAGIC` (from `kitty.h`) is defined as:
+
+```cpp
+const std::string KITTY_MAGIC = "KP01";
+```
+
+So the first 4 bytes of every `.kitty` file are:
+
+```
+K  P  0  1
+```
+
+—in ASCII (hex: `0x4B 0x50 0x30 0x31`)
+
+---
+
+## 🧩 The Purpose of a Magic Number
+
+It’s a *file identity check*.
+
+When you or anyone else tries to decompress a file, the code first reads the first 4 bytes:
+
+```cpp
+string magic(KITTY_MAGIC.size(), '\0');
+in.read(&magic[0], KITTY_MAGIC.size());
+if (magic != KITTY_MAGIC)
+    throw runtime_error("Invalid or corrupted .kitty file (missing signature).");
+```
+
+This ensures:
+✅ You’re decompressing a *valid KittyPress file*
+🚫 Not some random `.txt`, `.zip`, or corrupted binary file
+
+---
+
+### 🧱 Why it’s Important
+
+If you didn’t have `KP01`, imagine this:
+
+Someone renames `photo.jpg` → `photo.kitty`
+Then tries:
+
+```bash
+kittypress.exe decompress photo.kitty output.txt
+```
+
+Without a signature, KittyPress would try to interpret that JPG as Huffman-encoded data.
+The result? **Crash, garbage output, or corrupted memory.**
+
+With `KP01`, KittyPress instantly detects it’s not valid:
+
+```
+❌ Error: Invalid or corrupted .kitty file (missing signature)
+```
+
+Safe. Professional. Just like how `.zip`, `.png`, and `.pdf` do it.
+
+---
+
+## 🧠 Real-World Examples
+
+| File Type               | Signature (Magic Bytes)   | ASCII  | Purpose                       |
+| ----------------------- | ------------------------- | ------ | ----------------------------- |
+| PNG                     | `89 50 4E 47 0D 0A 1A 0A` | “PNG”  | Identify image                |
+| ZIP                     | `50 4B 03 04`             | “PK..” | Identify ZIP archive          |
+| PDF                     | `25 50 44 46`             | “%PDF” | Identify document             |
+| ELF (Linux executables) | `7F 45 4C 46`             | “.ELF” | Identify binary format        |
+| KittyPress 🐾           | `4B 50 30 31`             | “KP01” | Identify KittyPress v1 format |
+
+So your `"KP01"` is **exactly** what `PK` is for `.zip`.
+It’s the **trademark fingerprint of your file standard**.
+
+---
+
+## 🧩 Meaning Breakdown (you can define this officially)
+
+| Symbol | Meaning                                               |
+| ------ | ----------------------------------------------------- |
+| **K**  | Kitty                                                 |
+| **P**  | Press                                                 |
+| **0**  | Major format version (v0 → experimental, v1 → stable) |
+| **1**  | Minor revision (first release of v1)                  |
+
+So if you ever upgrade (say you add Run-Length Encoding before Huffman),
+you’d use a new signature like:
+
+```cpp
+const std::string KITTY_MAGIC = "KP02";
+```
+
+That tells decompressors, *“Hey, this is a new format — handle differently.”*
+
+---
+
+## 🧩 TL;DR
+
+`KP01` is:
+
+> A **4-byte signature** at the start of every `.kitty` file that identifies it as a **KittyPress v1** compressed archive.
+
+### 💡 It provides:
+
+* ✅ **Format validation**
+* 🧱 **Version control**
+* 💣 **Corruption protection**
+* 🪪 **Brand identity** (your “PK” for “KP”)
+
+---
+
+Would you like me to help you define the **official versioning rules** (like how `KP01`, `KP02`, etc., will evolve for new algorithm upgrades like RLE + Huffman or future hybrid methods)?
+
+
+
+
+
+Perfect. 🐾 That’s the *real* next step — performance.
+Right now, your **KittyPress (KP03)** is functionally solid — lossless, smart, and format-agnostic — but you’re absolutely right:
+⚠️ It’s *too slow* for medium or large files.
+
+Let’s talk about **why it’s slow**, and then I’ll show you *specific, safe optimizations* to make it **10×–50× faster** 🔥
+
+---
+
+## 🧩 WHY KITTY IS SLOW NOW
+
+### 1. **Naive LZ77**
+
+Your `lz77_compress()` currently looks like this:
+
+```cpp
+while (i < n) {
+    for (size_t j = start; j < i; ++j) {
+        while (data[j+k] == data[i+k]) k++;
+    }
+}
+```
+
+That’s an **O(n²)** algorithm — meaning time grows quadratically with file size.
+Even a 1 MB file can take seconds or minutes.
+
+✅ *Good news:* this is the biggest performance bottleneck, and also the easiest to fix.
+
+---
+
+### 2. **Huge string concatenations**
+
+Inside Huffman:
+
+```cpp
+encoded += huffmanCode[b];
+```
+
+That’s slow because it constantly resizes strings and copies memory.
+When compressing large binary files, this eats CPU time like crazy.
+
+We’ll switch to `std::vector<bool>` or `std::ostringstream` for fast bit appending.
+
+---
+
+### 3. **No streaming (everything in RAM)**
+
+Currently:
+
+* The file is fully read into memory (`vector<unsigned char> data`).
+* Then LZ77 compresses it.
+* Then Huffman compresses the entire memory buffer again.
+* Then the whole result is serialized again.
+
+That’s 3–4 full passes of your data in memory.
+For a few MB, it’s fine. For hundreds of MB, it’s very expensive.
+
+---
+
+## 🚀 HOW TO SPEED UP KITTY
+
+Here’s a staged roadmap:
+
+---
+
+### 🔹 **Stage 1 — Optimize LZ77 (Instant 10× speed boost)**
+
+Replace your naive LZ77 search with a **rolling window + hash table** or **KMP-style match finder**.
+
+A simple yet effective version:
+
+```cpp
+unordered_map<uint32_t, size_t> recent; // hash of 3-byte sequences
+...
+uint32_t key = (data[i] << 16) | (data[i+1] << 8) | data[i+2];
+if (recent.count(key)) {
+    size_t pos = recent[key];
+    // verify match length
+}
+recent[key] = i;
+```
+
+This reduces search complexity to ~O(n), instead of O(n²).
+
+👉 Estimated: compression of 500 KB → from 3 s → ~0.2 s.
+
+---
+
+### 🔹 **Stage 2 — Replace string concatenation**
+
+In `compressFile()`:
+
+```cpp
+string encoded;
+encoded.reserve(lz77_bytes.size() * 8);
+for (unsigned char b : lz77_bytes)
+    encoded += huffmanCode[b];
+```
+
+Instead:
+
+```cpp
+std::ostringstream encoded;
+for (unsigned char b : lz77_bytes)
+    encoded << huffmanCode[b];
+```
+
+Then use `encoded.str()` only once at the end.
+That avoids hundreds of memory reallocations.
+
+---
+
+### 🔹 **Stage 3 — Parallelize Huffman frequency counting**
+
+You can parallelize the histogram step with OpenMP or threads:
+
+```cpp
+#pragma omp parallel for reduction(+:freq[:256])
+for (size_t i = 0; i < data.size(); ++i)
+    freq[data[i]]++;
+```
+
+Multi-threaded frequency counting is trivial and safe (no race condition if you use `reduction`).
+
+⚡ Small improvement (1.2×–2×), but worth it for big files.
+
+---
+
+### 🔹 **Stage 4 — Stream large files**
+
+For files > 50 MB, you can process chunks of ~1 MB each:
+
+* Run LZ77/Huffman on each chunk separately.
+* Store each chunk in `.kitty` with its own header.
+
+That way, you don’t keep the whole file in RAM, and the tool remains responsive.
+
+---
+
+### 🔹 **Stage 5 — Compiler optimizations**
+
+You already use `-O2`.
+But add:
+
+```
+-Ofast -march=native -flto
+```
+
+to enable vectorization and link-time optimizations.
+That can squeeze another 10–20% speed.
+
+---
+
+## ⚙️ TL;DR — Speed Plan
+
+| Stage | Fix                         | Est. Gain             |
+| ----- | --------------------------- | --------------------- |
+| 1     | Faster LZ77 (hash-based)    | 🚀 5×–15×             |
+| 2     | Streamlined string handling | ⚡ 2×                  |
+| 3     | Parallel frequency count    | 💨 1.5×               |
+| 4     | Chunked streaming           | 🧠 2× for large files |
+| 5     | Compiler flags              | 🔧 10–20%             |
+
+Combined = **~30× faster** compression for big files
+(while keeping lossless behavior).
+
+---
+
+Would you like me to go ahead and write the **optimized LZ77.cpp + header (Stage 1 upgrade)** for you first?
+That’s the most impactful change — you’ll immediately feel the speed difference.
+
+
+
+
+
+Perfect — here’s exactly how you can test both ✅
+
+Make sure your compiled executable is in the `KittyPress` folder (along with your test samples).
+
+---
+
+## 🧪 **Test 1: Multiple individual files as input**
+
+Suppose your project structure looks like this:
+
+```
+D:\Code\Projects\KittyPress\
+ ├─ kittypress.exe
+ ├─ samples\
+ │   ├─ a.txt
+ │   ├─ b.txt
+ │   ├─ c.pdf
+```
+
+Then run this command in **PowerShell / CMD** from the `KittyPress` directory:
+
+```bash
+kittypress.exe compress samples\a.txt samples\b.txt samples\c.pdf samples\multi_test.kitty
+```
+
+✅ **Explanation**
+
+* `compress` → tells KittyPress to create an archive
+* then you list all input files
+* the **last argument** (`samples\multi_test.kitty`) is the **output archive file**
+
+➡️ Expected output:
+
+```
+🐾 Creating archive with 3 file(s)
+  + a.txt (412 → 189)
+  + b.txt (905 → 430)
+  + c.pdf (158 KB → 160 KB)
+✅ Archive created: samples\multi_test.kitty
+```
+
+---
+
+## 🧪 **Test 2: Folder input**
+
+Suppose you have this folder:
+
+```
+D:\Code\Projects\KittyPress\samples\docs\
+ ├─ intro.txt
+ ├─ data.json
+ ├─ notes\
+ │   ├─ summary.txt
+ │   ├─ chart.png
+```
+
+Then run:
+
+```bash
+kittypress.exe compress samples\docs samples\docs_archive.kitty
+```
+
+✅ **Explanation**
+
+* Passing a folder (`samples\docs`) makes KittyPress **recursively include all files** inside it.
+* It preserves the folder structure (so `notes/summary.txt` stays in `notes` inside the archive).
+
+➡️ Expected output:
+
+```
+🐾 Creating archive with 4 file(s)
+  + intro.txt (512 → 220)
+  + data.json (1 KB → 420)
+  + notes/summary.txt (355 → 170)
+  + notes/chart.png (77 KB → 78 KB)
+✅ Archive created: samples\docs_archive.kitty
+```
+
+---
+
+## 🧩 **Bonus: Extract them back**
+
+After creating either archive, you can test decompression like this:
+
+### For `multi_test.kitty`
+
+```bash
+kittypress.exe decompress samples\multi_test.kitty samples\restored_multi
+```
+
+### For `docs_archive.kitty`
+
+```bash
+kittypress.exe decompress samples\docs_archive.kitty samples\restored_docs
+```
+
+✅ Expected result:
+
+* It reconstructs all files and subfolders under the given output folder.
+* You’ll see messages like:
+
+  ```
+  ✔ a.txt (412 bytes)
+  ✔ b.txt (905 bytes)
+  ✔ c.pdf (158 KB)
+  ✅ Extraction finished → samples\restored_multi
+  ```
+
+---
+
+Would you like me to add a **progress percentage display** (for big folders) in `archive.cpp` next? It makes the UX feel more like WinRAR/7-Zip.
+
+
+
+
+💡 Optional .gitignore
+
+You might want to add a .gitignore file to avoid committing unnecessary build or temp files.
+Here’s a quick one for KittyPress:
+
+# Build outputs
+core/*.exe
+core/*.obj
+core/*.o
+core/*.tmp
+core/*.lz77.tmp
+core/*.enc.tmp
+
+# Python cache
+__pycache__/
+*.pyc
+
+# System files
+.DS_Store
+Thumbs.db
+
+# VS Code settings backup (optional)
+.vscode/
+
+
+
+
+Rebuild command
+g++ main.cpp archive.cpp huffman.cpp lz77.cpp bitstream.cpp -std=c++17 -O2 -static -static-libstdc++ -static-libgcc -o kittypress.exe
+
+
+Then test it:
+
+cd core
+kittypress.exe compress ..\samples\testsample ..\samples\testsample.kitty
+kittypress.exe compress ..\samples\githubtut.pdf ..\samples\githubtut.kitty
+kittypress.exe decompress ..\samples\testsample.kitty ..\samples\restored
+kittypress.exe decompress ..\samples\hello.kitty ..\samples\restored.txt
+
+32.29s before optimizations
+1.58s after optimization 1
+
